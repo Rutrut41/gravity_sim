@@ -5,6 +5,7 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <vector>
 #include <iostream>
+#include <random>
 
 const char* vertexShaderSource = R"glsl(#version 330 core
 layout(location=0)in vec3 aPos;uniform mat4 model;uniform mat4 view;uniform mat4 projection;
@@ -21,6 +22,7 @@ void main() {
 
 bool running = true;
 bool pause = false;
+bool mouseCoupled = true;
 glm::vec3 cameraPos   = glm::vec3(0.0f, 0.0f,  1.0f);
 glm::vec3 cameraFront = glm::vec3(0.0f, 0.0f, -1.0f);
 glm::vec3 cameraUp    = glm::vec3(0.0f, 1.0f,  0.0f);
@@ -29,8 +31,25 @@ float yaw = -90;
 float pitch =0.0;
 float deltaTime = 0.0;
 float lastFrame = 0.0;
+float globalTime = 0.0f;
+int windowWidth = 800;
+int windowHeight = 600;
+GLuint shaderProgram;
+GLint objectColorLoc;
+GLint projectionLoc;
+double currentMouseX = 0.0;
+double currentMouseY = 0.0;
+float initialFOV = 45.0f;
+float currentFOV = 45.0f;
+bool showSelectionBox = true;
+glm::vec3 initialCameraPos = glm::vec3(0.0f, 1000.0f, 15000.0f);
+bool isDragging = false;
+double lastDragY = 0.0;
+float focusY = 500.0f;
+float dragSensitivity = 0.0005f;
 
-const double G = 6.6743e-11; // m^3 kg^-1 s^-2
+const double G_BASE = 6.6743e-11; // m^3 kg^-1 s^-2
+double gravityMultiplier = 1.0;
 const float c = 299792458.0;
 float initMass = 5.0f * pow(10, 20) / 5;
 
@@ -41,10 +60,14 @@ void UpdateCam(GLuint shaderProgram, glm::vec3 cameraPos);
 void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods);
 void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods);
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset);
+void framebuffer_size_callback(GLFWwindow* window, int width, int height);
 
 void mouse_callback(GLFWwindow* window, double xpos, double ypos);
 glm::vec3 sphericalToCartesian(float r, float theta, float phi);
 void DrawGrid(GLuint shaderProgram, GLuint gridVAO, size_t vertexCount);
+void DrawSelectionBox();
+void DrawOrbits(GLuint shaderProgram);
+void DrawGravityDisplay();
 
 
 class Object {
@@ -64,14 +87,16 @@ class Object {
         float radius;
 
         glm::vec3 LastPos = position;
+        std::vector<glm::vec3> orbitTrail;
 
-        Object(glm::vec3 initPosition, glm::vec3 initVelocity, float mass, float density = 3344) {   
+        Object(glm::vec3 initPosition, glm::vec3 initVelocity, float mass, float density = 3344) {
             this->position = initPosition;
             this->velocity = initVelocity;
             this->mass = mass;
             this->density = density;
             this->radius = pow(((3 * this->mass/this->density)/(4 * 3.14159265359)), (1.0f/3.0f)) / 100000;
-            
+
+            orbitTrail.push_back(initPosition);
 
             // Generate vertices (centered at origin)
             std::vector<float> vertices = Draw();
@@ -85,7 +110,6 @@ class Object {
             int stacks = 10;
             int sectors = 10;
 
-            // Generate circumference points using integer steps
             for(float i = 0.0f; i <= stacks; ++i){
                 float theta1 = (i / stacks) * glm::pi<float>();
                 float theta2 = (i+1) / stacks * glm::pi<float>();
@@ -97,16 +121,29 @@ class Object {
                     glm::vec3 v3 = sphericalToCartesian(radius, theta2, phi1);
                     glm::vec3 v4 = sphericalToCartesian(radius, theta2, phi2);
 
-                    // Triangle 1: v1-v2-v3
-                    vertices.insert(vertices.end(), {v1.x, v1.y, v1.z}); //      /|
-                    vertices.insert(vertices.end(), {v2.x, v2.y, v2.z}); //     / |
-                    vertices.insert(vertices.end(), {v3.x, v3.y, v3.z}); //    /__|
-                    
-                    // Triangle 2: v2-v4-v3
+                    auto applyDeformation = [](glm::vec3& v) {
+                        float len = glm::length(v);
+                        glm::vec3 dir = glm::normalize(v);
+                        float deform = 1.0f + 0.4f * sin(globalTime * 2.5f + dir.x * 3.0f)
+                                             + 0.3f * cos(globalTime * 1.8f + dir.y * 2.5f)
+                                             + 0.35f * sin(globalTime * 3.2f + dir.z * 2.0f)
+                                             + 0.25f * sin(globalTime * 1.4f);
+                        v = dir * len * deform;
+                    };
+
+                    applyDeformation(v1);
+                    applyDeformation(v2);
+                    applyDeformation(v3);
+                    applyDeformation(v4);
+
+                    vertices.insert(vertices.end(), {v1.x, v1.y, v1.z});
+                    vertices.insert(vertices.end(), {v2.x, v2.y, v2.z});
+                    vertices.insert(vertices.end(), {v3.x, v3.y, v3.z});
+
                     vertices.insert(vertices.end(), {v2.x, v2.y, v2.z});
                     vertices.insert(vertices.end(), {v4.x, v4.y, v4.z});
                     vertices.insert(vertices.end(), {v3.x, v3.y, v3.z});
-                }   
+                }
             }
             return vertices;
         }
@@ -143,6 +180,13 @@ class Object {
             }
             return 1.0f;
         }
+
+        void UpdateOrbitTrail() {
+            orbitTrail.push_back(position);
+            if (orbitTrail.size() > 2500) {
+                orbitTrail.erase(orbitTrail.begin());
+            }
+        }
 };
 std::vector<Object> objs = {};
 
@@ -153,38 +197,71 @@ GLuint gridVAO, gridVBO; // 100x100 grid with 10 divisions
 
 int main() {
     GLFWwindow* window = StartGLU();
-    GLuint shaderProgram = CreateShaderProgram(vertexShaderSource, fragmentShaderSource);
+    shaderProgram = CreateShaderProgram(vertexShaderSource, fragmentShaderSource);
 
     GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
-    GLint objectColorLoc = glGetUniformLocation(shaderProgram, "objectColor");
+    objectColorLoc = glGetUniformLocation(shaderProgram, "objectColor");
     glUseProgram(shaderProgram);
 
     glfwSetCursorPosCallback(window, mouse_callback);
     glfwSetScrollCallback(window, scroll_callback);
-    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    mouseCoupled = false;
+
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
 
     //projection matrix
-    glm::mat4 projection = glm::perspective(glm::radians(45.0f), 800.0f / 600.0f, 0.1f, 750000.0f);
-    GLint projectionLoc = glGetUniformLocation(shaderProgram, "projection");
+    glm::mat4 projection = glm::perspective(glm::radians(45.0f), (float)windowWidth / (float)windowHeight, 0.1f, 750000.0f);
+    projectionLoc = glGetUniformLocation(shaderProgram, "projection");
     glUniformMatrix4fv(projectionLoc, 1, GL_FALSE, glm::value_ptr(projection));
-    cameraPos = glm::vec3(0.0f, 1000.0f,  5000.0f);
+    cameraPos = glm::vec3(0.0f, 1000.0f,  15000.0f);
+    initialCameraPos = cameraPos;
 
-    
+
     objs = {
-        Object(glm::vec3(3844, 0, 0), glm::vec3(0, 0, 228), 7.34767309*pow(10, 22), 3344),
-        // Object(glm::vec3(-250, 0, 0), glm::vec3(0, -50, 0), 7.34767309*pow(10, 22), 3344),
-        Object(glm::vec3(0, 0, 0), glm::vec3(0, 0, 0), 5.97219*pow(10, 24), 5515),
+        // Original Earth and Moon - separated much further
+        Object(glm::vec3(-10000, 500, 0), glm::vec3(0, 0, 200), 5.97219*pow(10, 24), 5515),
+        Object(glm::vec3(10000, 500, 0), glm::vec3(0, 0, -200), 7.34767309*pow(10, 22), 3344),
 
+        // Test objects with various sizes - positioned far apart
+        // Red object - 2x Earth mass
+        Object(glm::vec3(0, 500, 15000), glm::vec3(-150, 0, 0), 1.2*pow(10, 24), 5515),
+        // Blue object - 4x Earth mass
+        Object(glm::vec3(-8000, 500, -8000), glm::vec3(100, 0, 100), 2.4*pow(10, 24), 5515),
+        // Green object - 1x Earth mass
+        Object(glm::vec3(8000, 500, -8000), glm::vec3(-100, 0, -100), 5.97219*pow(10, 23), 5515),
+        // Yellow object - 3x Earth mass
+        Object(glm::vec3(0, 500, -15000), glm::vec3(150, 0, 0), 1.8*pow(10, 24), 5515),
+        // Purple object - 5x Earth mass
+        Object(glm::vec3(15000, 500, 5000), glm::vec3(-120, 160, 0), 2.98*pow(10, 24), 5515),
+        // Cyan object - 6x Earth mass
+        Object(glm::vec3(-15000, 500, -5000), glm::vec3(140, -140, 0), 3.58*pow(10, 24), 5515),
     };
+
+    // Set custom colors for test objects
+    objs[0].color = glm::vec4(0.0f, 0.5f, 1.0f, 1.0f);   // Earth - Blue
+    objs[1].color = glm::vec4(1.0f, 0.8f, 0.0f, 1.0f);   // Moon - Yellow
+    objs[2].color = glm::vec4(1.0f, 0.2f, 0.2f, 1.0f);   // Red
+    objs[3].color = glm::vec4(0.2f, 0.2f, 1.0f, 1.0f);   // Blue
+    objs[4].color = glm::vec4(0.2f, 1.0f, 0.2f, 1.0f);   // Green
+    objs[5].color = glm::vec4(1.0f, 1.0f, 0.2f, 1.0f);   // Yellow
+    objs[6].color = glm::vec4(1.0f, 0.2f, 1.0f, 1.0f);   // Purple
+    objs[7].color = glm::vec4(0.2f, 1.0f, 1.0f, 1.0f);   // Cyan
+
     std::vector<float> gridVertices = CreateGridVertices(100000.0f, 50, objs);
     CreateVBOVAO(gridVAO, gridVBO, gridVertices.data(), gridVertices.size());
-    std::cout<<"Earth radius: "<<objs[1].radius<<std::endl;
-    std::cout<<"Moon radius: "<<objs[0].radius<<std::endl;
+    std::cout<<"Earth radius: "<<objs[0].radius<<std::endl;
+    std::cout<<"Moon radius: "<<objs[1].radius<<std::endl;
+    for(size_t i = 2; i < objs.size(); i++) {
+        std::cout<<"Test object "<<i<<" radius: "<<objs[i].radius<<std::endl;
+    }
 
     while (!glfwWindowShouldClose(window) && running == true) {
         float currentFrame = glfwGetTime();
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
+        globalTime = currentFrame;
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -216,6 +293,16 @@ int main() {
         glBufferData(GL_ARRAY_BUFFER, gridVertices.size() * sizeof(float), gridVertices.data(), GL_DYNAMIC_DRAW);
         DrawGrid(shaderProgram, gridVAO, gridVertices.size());
 
+        for(auto& obj : objs) {
+            obj.UpdateOrbitTrail();
+        }
+
+        DrawOrbits(shaderProgram);
+
+        for(auto& obj : objs) {
+            obj.UpdateVertices();
+        }
+
         // Draw the triangle
         for(auto& obj : objs) {
             glUniform4f(objectColorLoc, obj.color.r, obj.color.g, obj.color.b, obj.color.a);
@@ -230,8 +317,13 @@ int main() {
                     if (distance > 0) {
                         std::vector<float> direction = {dx / distance, dy / distance, dz / distance};
                         distance *= 1000;
-                        double Gforce = (G * obj.mass * obj2.mass) / (distance * distance);
-                        
+                        double Gforce = (G_BASE * gravityMultiplier * obj.mass * obj2.mass) / (distance * distance);
+
+                        // Prevent planets from sticking together by reducing gravity at close range
+                        float minDistance = (obj.radius + obj2.radius) * 3.0f;
+                        if (distance / 1000.0f < minDistance) {
+                            Gforce *= 0.05; // Reduce gravity significantly when too close, allows them to orbit
+                        }
 
                         float acc1 = Gforce / obj.mass;
                         std::vector<float> acc = {direction[0] * acc1, direction[1]*acc1, direction[2]*acc1};
@@ -260,7 +352,9 @@ int main() {
             glBindVertexArray(obj.VAO);
             glDrawArrays(GL_TRIANGLES, 0, obj.vertexCount / 3);
         }
-        
+
+        DrawGravityDisplay();
+        DrawSelectionBox();
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
@@ -373,7 +467,7 @@ void UpdateCam(GLuint shaderProgram, glm::vec3 cameraPos) {
 }
 
 void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
-    float cameraSpeed = 1000.0f * deltaTime;
+    float cameraSpeed = 500.0f * deltaTime;
     bool shiftPressed = (mods & GLFW_MOD_SHIFT) != 0;
     Object& lastObj = objs[objs.size() - 1];
     
@@ -412,6 +506,142 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         running = false;
     }
 
+    if (key == GLFW_KEY_TAB && action == GLFW_PRESS) {
+        mouseCoupled = !mouseCoupled;
+        if (mouseCoupled) {
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        } else {
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        }
+    }
+
+    if (key == GLFW_KEY_EQUAL && action == GLFW_PRESS) {
+        float centerX = windowWidth / 2.0f;
+        float centerY = windowHeight / 2.0f;
+        float offsetX = (currentMouseX - centerX) / centerX;
+        float offsetY = (currentMouseY - centerY) / centerY;
+
+        glm::vec3 right = glm::normalize(glm::cross(cameraFront, cameraUp));
+        glm::vec3 moveDir = cameraFront + right * offsetX * 0.5f + cameraUp * offsetY * 0.5f;
+        moveDir = glm::normalize(moveDir);
+
+        cameraPos += moveDir * 1500.0f;
+        cameraPos.y = focusY;
+    }
+
+    if (key == GLFW_KEY_MINUS && action == GLFW_PRESS) {
+        float centerX = windowWidth / 2.0f;
+        float centerY = windowHeight / 2.0f;
+        float offsetX = (currentMouseX - centerX) / centerX;
+        float offsetY = (currentMouseY - centerY) / centerY;
+
+        glm::vec3 right = glm::normalize(glm::cross(cameraFront, cameraUp));
+        glm::vec3 moveDir = cameraFront + right * offsetX * 0.5f + cameraUp * offsetY * 0.5f;
+        moveDir = glm::normalize(moveDir);
+
+        cameraPos -= moveDir * 1500.0f;
+        cameraPos.y = focusY;
+    }
+
+    if (key == GLFW_KEY_1 && action == GLFW_PRESS) {
+        gravityMultiplier *= 0.8f;
+        if (gravityMultiplier < 0.01f) gravityMultiplier = 0.01f;
+        std::cout << "Gravidade reduzida: " << gravityMultiplier << std::endl;
+    }
+
+    if (key == GLFW_KEY_2 && action == GLFW_PRESS) {
+        gravityMultiplier *= 1.25f;
+        if (gravityMultiplier > 100.0f) gravityMultiplier = 100.0f;
+        std::cout << "Gravidade aumentada: " << gravityMultiplier << std::endl;
+    }
+
+    if (key == GLFW_KEY_5 && action == GLFW_PRESS) {
+        glm::mat4 projection = glm::perspective(glm::radians(45.0f), (float)windowWidth / (float)windowHeight, 0.1f, 750000.0f);
+        glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
+        glm::mat4 viewProj = projection * view;
+
+        float boxSize = windowWidth * 0.15f;
+        float halfBox = boxSize / 2.0f;
+        int selectedObjIndex = -1;
+
+        for (size_t i = 0; i < objs.size(); i++) {
+            glm::vec4 objScreenPos = viewProj * glm::vec4(objs[i].position, 1.0f);
+            objScreenPos /= objScreenPos.w;
+
+            float screenX = (objScreenPos.x + 1.0f) * 0.5f * windowWidth;
+            float screenY = (1.0f - objScreenPos.y) * 0.5f * windowHeight;
+
+            if (screenX > currentMouseX - halfBox && screenX < currentMouseX + halfBox &&
+                screenY > currentMouseY - halfBox && screenY < currentMouseY + halfBox &&
+                objScreenPos.z > 0) {
+                selectedObjIndex = i;
+                break;
+            }
+        }
+
+        if (selectedObjIndex >= 0) {
+            Object& selectedObj = objs[selectedObjIndex];
+            float radiusRatio = 0.75f;
+            float newMass = selectedObj.mass * (radiusRatio * radiusRatio * radiusRatio);
+
+            glm::vec3 newPos = selectedObj.position;
+            if (!selectedObj.orbitTrail.empty()) {
+                newPos = selectedObj.orbitTrail.front();
+            }
+
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_real_distribution<> speedVariation(0.8f, 1.2f);
+            std::uniform_real_distribution<> directionVariation(-1.0f, 1.0f);
+
+            float speedMultiplier = speedVariation(gen);
+            glm::vec3 velocityVariation = selectedObj.velocity * speedMultiplier;
+
+            glm::vec3 randomOffset = glm::vec3(
+                directionVariation(gen) * glm::length(selectedObj.velocity),
+                directionVariation(gen) * glm::length(selectedObj.velocity),
+                directionVariation(gen) * glm::length(selectedObj.velocity)
+            );
+
+            glm::vec3 finalVelocity = velocityVariation + randomOffset;
+
+            objs.emplace_back(newPos, finalVelocity, newMass, selectedObj.density);
+            objs.back().color = selectedObj.color;
+            objs.back().color.w = 1.0f;
+
+            std::cout << "Nova planeta criada! Tamanho: " << (radiusRatio * 100.0f) << "% do original" << std::endl;
+        } else {
+            std::cout << "Nenhuma planeta dentro da caixa de selecao!" << std::endl;
+        }
+    }
+
+    if (key == GLFW_KEY_4 && action == GLFW_PRESS) {
+        float separationThreshold = 10000.0f;
+        float pushDistance = 3000.0f;
+        int count = 0;
+
+        std::cout << "Botao 4 pressionado! Verificando planetas..." << std::endl;
+
+        for (size_t i = 0; i < objs.size(); i++) {
+            for (size_t j = i + 1; j < objs.size(); j++) {
+                glm::vec3 diff = objs[j].position - objs[i].position;
+                float distance = glm::length(diff);
+
+                std::cout << "Distancia entre planeta " << i << " e " << j << ": " << distance << std::endl;
+
+                if (distance < separationThreshold && distance > 0.1f) {
+                    glm::vec3 direction = glm::normalize(diff);
+
+                    objs[i].velocity -= direction * pushDistance * 0.01f;
+                    objs[j].velocity += direction * pushDistance * 0.01f;
+                    count++;
+                    std::cout << "Despegando par " << i << " e " << j << std::endl;
+                }
+            }
+        }
+        std::cout << "Total de pares despegados: " << count << std::endl;
+    }
+
     // init arrows pos up down left right
     if(!objs.empty() && objs[objs.size() - 1].Initalizing){
         if (key == GLFW_KEY_UP && (action == GLFW_PRESS || action == GLFW_REPEAT)){
@@ -441,13 +671,23 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
     
 };
 void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
+    currentMouseX = xpos;
+    currentMouseY = ypos;
+
+    if (isDragging) {
+        float dragDelta = (ypos - lastDragY) * dragSensitivity;
+        focusY += dragDelta;
+        lastDragY = ypos;
+    }
+
+    if (!mouseCoupled) return;
 
     float xoffset = xpos - lastX;
-    float yoffset = lastY - ypos; 
+    float yoffset = lastY - ypos;
     lastX = xpos;
     lastY = ypos;
 
-    float sensitivity = 0.1f;
+    float sensitivity = 0.003f;
     xoffset *= sensitivity;
     yoffset *= sensitivity;
 
@@ -466,19 +706,23 @@ void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
 void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods){
     if (button == GLFW_MOUSE_BUTTON_LEFT){
         if (action == GLFW_PRESS){
-            objs.emplace_back(glm::vec3(0.0, 0.0, 0.0), glm::vec3(0.0f, 0.0f, 0.0f), initMass);
-            objs[objs.size()-1].Initalizing = true;
+            if (!mouseCoupled) {
+                isDragging = true;
+                lastDragY = currentMouseY;
+            } else {
+                objs.emplace_back(glm::vec3(0.0, 0.0, 0.0), glm::vec3(0.0f, 0.0f, 0.0f), initMass);
+                objs[objs.size()-1].Initalizing = true;
+            }
         };
         if (action == GLFW_RELEASE){
-            objs[objs.size()-1].Initalizing = false;
-            objs[objs.size()-1].Launched = true;
+            if (isDragging) {
+                isDragging = false;
+            } else if (!objs.empty()) {
+                objs[objs.size()-1].Initalizing = false;
+                objs[objs.size()-1].Launched = true;
+            }
         };
     };
-    // if (!objs.empty() && button == GLFW_MOUSE_BUTTON_RIGHT && objs[objs.size()-1].Initalizing) {
-    //     if (action == GLFW_PRESS || action == GLFW_REPEAT) {
-    //         objs[objs.size()-1].mass *= 1.2;}
-    //         std::cout<<"MASS: "<<objs[objs.size()-1].mass<<std::endl;
-    // }
 };
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset){
     float cameraSpeed = 50000.0f * deltaTime;
@@ -487,6 +731,15 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset){
     } else if(yoffset<0){
         cameraPos -= cameraSpeed * cameraFront;
     }
+}
+
+void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    windowWidth = width;
+    windowHeight = height;
+    glViewport(0, 0, width, height);
+    glm::mat4 projection = glm::perspective(glm::radians(45.0f), (float)width / (float)height, 0.1f, 750000.0f);
+    glUseProgram(shaderProgram);
+    glUniformMatrix4fv(projectionLoc, 1, GL_FALSE, glm::value_ptr(projection));
 }
 
 glm::vec3 sphericalToCartesian(float r, float theta, float phi){
@@ -506,6 +759,97 @@ void DrawGrid(GLuint shaderProgram, GLuint gridVAO, size_t vertexCount) {
     glDrawArrays(GL_LINES, 0, vertexCount / 3);
     glBindVertexArray(0);
 }
+
+void DrawSelectionBox() {
+    glUseProgram(0);
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0.0, (float)windowWidth, (float)windowHeight, 0.0, -1.0, 1.0);
+
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glDisable(GL_DEPTH_TEST);
+
+    float boxSize = windowWidth * 0.15f;
+    float halfBox = boxSize / 2.0f;
+
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    glLineWidth(2.0f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(currentMouseX - halfBox, currentMouseY - halfBox);
+    glVertex2f(currentMouseX + halfBox, currentMouseY - halfBox);
+    glVertex2f(currentMouseX + halfBox, currentMouseY + halfBox);
+    glVertex2f(currentMouseX - halfBox, currentMouseY + halfBox);
+    glEnd();
+    glLineWidth(1.0f);
+
+    glEnable(GL_DEPTH_TEST);
+    glPopMatrix();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glUseProgram(shaderProgram);
+}
+
+void DrawGravityDisplay() {
+    // Gravity value is displayed in console with each button press
+}
+
+void DrawOrbits(GLuint shaderProgram) {
+    glPushAttrib(GL_ALL_ATTRIB_BITS);
+    glPushMatrix();
+
+    int tubeSegments = 8;
+
+    for (const auto& obj : objs) {
+        if (obj.orbitTrail.size() > 1) {
+            float tubeRadius = obj.radius * 0.4f;
+            glColor3f(obj.color.r, obj.color.g, obj.color.b);
+
+            for (size_t i = 0; i < obj.orbitTrail.size() - 1; i++) {
+                glm::vec3 p1 = obj.orbitTrail[i];
+                glm::vec3 p2 = obj.orbitTrail[i + 1];
+                glm::vec3 direction = glm::normalize(p2 - p1);
+
+                glm::vec3 perpendicular = glm::vec3(0, 1, 0);
+                if (glm::abs(glm::dot(direction, perpendicular)) > 0.9f) {
+                    perpendicular = glm::vec3(1, 0, 0);
+                }
+
+                glm::vec3 right = glm::normalize(glm::cross(direction, perpendicular));
+                glm::vec3 up = glm::normalize(glm::cross(right, direction));
+
+                glBegin(GL_QUAD_STRIP);
+                for (int j = 0; j <= tubeSegments; j++) {
+                    float angle = 2.0f * 3.14159265f * j / tubeSegments;
+                    float cosA = cos(angle);
+                    float sinA = sin(angle);
+
+                    glm::vec3 offset1 = (cosA * right + sinA * up) * tubeRadius;
+                    glm::vec3 offset2 = (cosA * right + sinA * up) * tubeRadius;
+
+                    float brightness1 = (p1.z + 10000.0f) / 20000.0f;
+                    float brightness2 = (p2.z + 10000.0f) / 20000.0f;
+                    brightness1 = glm::clamp(brightness1, 0.1f, 1.5f);
+                    brightness2 = glm::clamp(brightness2, 0.1f, 1.5f);
+
+                    glColor3f(obj.color.r * brightness1, obj.color.g * brightness1, obj.color.b * brightness1);
+                    glVertex3f(p1.x + offset1.x, p1.y + offset1.y, p1.z + offset1.z);
+                    glColor3f(obj.color.r * brightness2, obj.color.g * brightness2, obj.color.b * brightness2);
+                    glVertex3f(p2.x + offset2.x, p2.y + offset2.y, p2.z + offset2.z);
+                }
+                glEnd();
+            }
+        }
+    }
+
+    glPopMatrix();
+    glPopAttrib();
+}
+
 std::vector<float> CreateGridVertices(float size, int divisions, const std::vector<Object>& objs) {
     std::vector<float> vertices;
     float step = size / divisions;
@@ -589,7 +933,7 @@ std::vector<float> CreateGridVertices(float size, int divisions, const std::vect
             float distance = glm::length(toObject);
 
             float distance_m = distance * 1000.0f;
-            float rs = (2*G*obj.mass)/(c*c);
+            float rs = (2*G_BASE*obj.mass)/(c*c);
 
             float z = 2 * sqrt(rs*(distance_m - rs)) * 100.0f;
             totalDisplacement += z;
